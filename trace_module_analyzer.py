@@ -47,6 +47,7 @@ PhaseDetector (prefill vs decode):
 
 import argparse
 import bisect
+import csv
 import gzip
 import json
 import logging
@@ -593,41 +594,34 @@ class CpuOpCorrelator:
 # Module aggregator
 # ---------------------------------------------------------------------------
 
-# Simple kernel category classification based on kernel name
-_KERNEL_CATEGORIES = [
-    ("communication", re.compile(
-        r"all_reduce|cross_device_reduce|nccl|rccl|broadcast|allgather|reduce_scatter|quickreduce"
-        r"|all_to_all",
-        re.IGNORECASE)),
-    ("embedding", re.compile(r"embedding|rotary|rope|pos_enc", re.IGNORECASE)),
-    ("attention", re.compile(
-        r"aiter::mla_|mla_a8w8|decode_attention|flash_attn|attention|softmax|fmha_|FmhaBatchPrefill"
-        r"|mla_reduce|kv_cache|flashinfer|set_mla_kv|paged_attention|radix"
-        r"|chunk_gated_delta_rule|chunk_fwd_kernel|causal_conv1d|fused_gdn", re.IGNORECASE)),
-    ("moe", re.compile(
-        r"fused_moe|moe_align|topk|expert|MoeFlatmm|MoeSorting|kernel_moe_gemm|kernel_moe_mxgemm"
-        r"|shared_experts|grouped_topk|moe_fused_gate|moeSoftmax", re.IGNORECASE)),
-    ("quantization", re.compile(
-        r"mxfp4|fp8|quant|_gemm_afp4|_fused_rms_mxfp4|dynamic_per_group_scaled_quant"
-        r"|_dynamic_mxfp4|fp4x2|_gemm_a8w8|_batched_gemm_a8w8|_fused_rms_fp8", re.IGNORECASE)),
-    ("gemm", re.compile(
-        r"Cijk_Alik_Bljk|Cijk_Ailk_Bljk|Cijk_SB_|_gemm_a16_w16|Custom_Cijk|gemm|matmul|nvjet",
-        re.IGNORECASE)),
-    ("normalization", re.compile(
-        r"layer_norm|rmsnorm|rms_norm|batch_norm|group_norm|scale_shift"
-        r"|rsqrt|_mean_pow",
-        re.IGNORECASE)),
-    ("conv", re.compile(r"conv2d|conv3d|convolution|Im2Col", re.IGNORECASE)),
-    ("elementwise", re.compile(
-        r"vectorized_elementwise|elementwise_kernel|binary_op|unary_op"
-        r"|aten::add|aten::mul|aten::sub|aten::div|aten::neg|aten::abs|aten::clamp"
-        r"|add_kernel|mul_kernel|sub_kernel|div_kernel|fused_add|residual_add"
-        r"|CastKernel|cast_kernel|type_cast|fused_bias"
-        r"|_to_copy|fused_copy_|fused_zeros|fused_any|fused_fill|fused_where"
-        r"|fused_mul_|fused_pow|fused_neg|fused_abs"
-        r"|act_and_mul|silu|gelu|relu|swish|sigmoid_gating",
-        re.IGNORECASE)),
-]
+# ---------------------------------------------------------------------------
+# Kernel category classification — loaded from kernel_categories.csv
+# ---------------------------------------------------------------------------
+
+_DEFAULT_CSV = os.path.join(os.path.dirname(os.path.abspath(__file__)), "kernel_categories.csv")
+
+
+def _load_kernel_categories(csv_path: str = _DEFAULT_CSV) -> List[Tuple[str, re.Pattern]]:
+    """Load (category, compiled_regex) list from a CSV file.
+
+    The CSV must have columns: category, pattern
+    Each pattern is a regex alternation (e.g. "nccl|rccl|all_reduce").
+    Rows are matched top-to-bottom; first match wins.
+    """
+    if not os.path.isfile(csv_path):
+        logger.warning("kernel_categories.csv not found at %s, no categories loaded", csv_path)
+        return []
+    categories = []
+    with open(csv_path, "r", encoding="utf-8") as f:
+        reader = csv.DictReader(f)
+        for row in reader:
+            cat = row["category"].strip()
+            pat = row["pattern"].strip()
+            categories.append((cat, re.compile(pat, re.IGNORECASE)))
+    return categories
+
+
+_KERNEL_CATEGORIES = _load_kernel_categories()
 
 
 def _categorize_kernel(name: str) -> str:
