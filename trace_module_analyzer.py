@@ -730,7 +730,6 @@ class PhaseDetector:
 # ---------------------------------------------------------------------------
 
 def _generate_model_info(roots: List[ModuleNode],
-                         config_path: Optional[str] = None,
                          png_path: Optional[str] = None
                          ) -> Tuple[Optional[str], Optional[str]]:
     """Build architecture diagram text + optional PNG from already-parsed module roots.
@@ -754,12 +753,7 @@ def _generate_model_info(roots: List[ModuleNode],
     best_root = max(roots, key=lambda r: r.end - r.ts)
     root_type = best_root.module_type
 
-    cfg = {}
-    if config_path and os.path.isfile(config_path):
-        with open(config_path, "r", encoding="utf-8") as f:
-            cfg = json.load(f)
-
-    template = match_template(root_type, cfg, raw_root=best_root)
+    template = match_template(root_type, {}, raw_root=best_root)
     if template is None:
         logger.info("No arch template for %s, skipping Model Info tab", root_type)
         return None, None
@@ -786,175 +780,8 @@ def _generate_model_info(roots: List[ModuleNode],
 class ReportGenerator:
     """Generate console and Excel reports from module stats."""
 
-    def print_hierarchy(self, stats_list: List[ModuleStats], mode: str,
-                        module_filter: Optional[str] = None, top_n: int = 5,
-                        collapse: bool = True):
-        """Print hierarchical module report to console."""
-        print("\n" + "=" * 70)
-        print("  Model Module Hierarchy")
-        print("=" * 70)
-
-        for stats in stats_list:
-            self._print_node(stats, mode, module_filter, top_n, prefix="", is_last=True,
-                             collapse=collapse)
-
-    def _print_node(self, stats: ModuleStats, mode: str,
-                    module_filter: Optional[str], top_n: int,
-                    prefix: str, is_last: bool, collapse: bool = True):
-        # Apply filter
-        if module_filter and module_filter not in stats.module_type:
-            # Still recurse children in case they match
-            for i, child in enumerate(stats.children_stats):
-                self._print_node(child, mode, module_filter, top_n,
-                                 prefix, i == len(stats.children_stats) - 1,
-                                 collapse=collapse)
-            return
-
-        time_val = stats.total_kernel_time if mode == "full" else stats.total_cpu_op_time
-        count = stats.kernel_count if mode == "full" else stats.cpu_op_count
-        count_label = "kernels" if mode == "full" else "ops"
-
-        connector = "\u2514\u2500 " if is_last else "\u251c\u2500 "
-        phase_tag = f" [{getattr(stats, 'phase', '')}]" if getattr(stats, "phase", "") else ""
-
-        print(f"{prefix}{connector}{stats.name}  [{time_val:,.0f} us, {count} {count_label}]{phase_tag}")
-
-        child_prefix = prefix + ("   " if is_last else "\u2502  ")
-
-        # Print breakdown if this node has significant content
-        if time_val > 0 and stats.kernel_breakdown:
-            sorted_cats = sorted(stats.kernel_breakdown.items(), key=lambda x: -x[1][0])
-            for cat, (dur, cnt) in sorted_cats:
-                if dur <= 0:
-                    continue
-                pct = dur / time_val * 100 if time_val > 0 else 0
-                print(f"{child_prefix}   {cat:15s} {dur:>12,.0f} us ({pct:5.1f}%, {cnt} items)")
-
-        # Print children
-        if collapse:
-            self._print_children_collapsed(stats.children_stats, mode, module_filter,
-                                           top_n, child_prefix)
-        else:
-            for i, child in enumerate(stats.children_stats):
-                self._print_node(child, mode, module_filter, top_n,
-                                 child_prefix, i == len(stats.children_stats) - 1,
-                                 collapse=False)
-
-    @staticmethod
-    def _group_consecutive_same_type(children: List[ModuleStats]):
-        """Group consecutive children with the same module_type.
-
-        Returns a list where each element is either a single ModuleStats
-        (standalone) or a list of ModuleStats (consecutive same-type run).
-        """
-        if not children:
-            return []
-        groups: list = []
-        current = [children[0]]
-        for child in children[1:]:
-            if child.module_type == current[0].module_type:
-                current.append(child)
-            else:
-                groups.append(current if len(current) > 1 else current[0])
-                current = [child]
-        groups.append(current if len(current) > 1 else current[0])
-        return groups
-
-    def _print_children_collapsed(self, children: List[ModuleStats], mode: str,
-                                  module_filter: Optional[str], top_n: int,
-                                  prefix: str):
-        """Print children, collapsing runs of 3+ consecutive same-type siblings."""
-        groups = self._group_consecutive_same_type(children)
-
-        # Flatten groups into printable items: ('single', stats) or ('collapsed', [stats])
-        printable: list = []
-        for group in groups:
-            if isinstance(group, ModuleStats):
-                printable.append(('single', group))
-            elif len(group) < 3:
-                for s in group:
-                    printable.append(('single', s))
-            else:
-                # Detect outliers within the run (>50% deviation from median)
-                times = [(s.total_kernel_time if mode == "full" else s.total_cpu_op_time)
-                         for s in group]
-                sorted_times = sorted(times)
-                median_t = sorted_times[len(sorted_times) // 2]
-
-                # Walk through the group, splitting into outlier singles and normal runs
-                i = 0
-                while i < len(group):
-                    if median_t > 0 and abs(times[i] - median_t) / median_t > 0.5:
-                        printable.append(('single', group[i]))
-                        i += 1
-                    else:
-                        run_start = i
-                        while i < len(group):
-                            if median_t > 0 and abs(times[i] - median_t) / median_t > 0.5:
-                                break
-                            i += 1
-                        run = group[run_start:i]
-                        if len(run) >= 3:
-                            printable.append(('collapsed', run))
-                        else:
-                            for s in run:
-                                printable.append(('single', s))
-
-        for idx, (kind, item) in enumerate(printable):
-            is_last = idx == len(printable) - 1
-            if kind == 'single':
-                self._print_node(item, mode, module_filter, top_n, prefix, is_last,
-                                 collapse=True)
-            else:
-                self._print_collapsed_summary(item, mode, prefix, is_last)
-
-    def _print_collapsed_summary(self, group: List[ModuleStats], mode: str,
-                                 prefix: str, is_last: bool):
-        """Print a single summary line for a collapsed run of same-type layers."""
-        module_type = group[0].module_type
-        first_id = group[0].instance_id
-        last_id = group[-1].instance_id
-        n = len(group)
-
-        times = [(s.total_kernel_time if mode == "full" else s.total_cpu_op_time) for s in group]
-        counts = [(s.kernel_count if mode == "full" else s.cpu_op_count) for s in group]
-        count_label = "kernels" if mode == "full" else "ops"
-
-        avg_time = sum(times) / n
-        total_time = sum(times)
-        min_time = min(times)
-        max_time = max(times)
-        avg_count = sum(counts) / n
-
-        phase = getattr(group[0], 'phase', '')
-        phase_tag = f" [{phase}]" if phase else ""
-
-        connector = "\u2514\u2500 " if is_last else "\u251c\u2500 "
-        child_prefix = prefix + ("   " if is_last else "\u2502  ")
-
-        print(f"{prefix}{connector}{module_type}  "
-              f"[\u00d7{n}, id {first_id}..{last_id}]  "
-              f"[avg {avg_time:,.0f} us, ~{avg_count:.0f} {count_label}]  "
-              f"[total {total_time:,.0f} us, range {min_time:,.0f}..{max_time:,.0f}]{phase_tag}")
-
-        # Aggregated breakdown (averaged)
-        agg_breakdown: Dict[str, Tuple[float, int]] = {}
-        for s in group:
-            for cat, (dur, cnt) in s.kernel_breakdown.items():
-                prev_dur, prev_cnt = agg_breakdown.get(cat, (0.0, 0))
-                agg_breakdown[cat] = (prev_dur + dur, prev_cnt + cnt)
-
-        sorted_cats = sorted(agg_breakdown.items(), key=lambda x: -x[1][0])
-        for cat, (dur, cnt) in sorted_cats:
-            if dur <= 0:
-                continue
-            avg_dur = dur / n
-            avg_cnt = cnt / n
-            pct = avg_dur / avg_time * 100 if avg_time > 0 else 0
-            print(f"{child_prefix}   {cat:15s} avg {avg_dur:>9,.0f} us ({pct:5.1f}%, ~{avg_cnt:.0f} items)")
-
     def print_layer_detail(self, stats_list: List[ModuleStats], mode: str,
-                           detail_module: str, detail_instance: Optional[int] = None):
+                           detail_module: str, module_index: Optional[int] = None):
         """Print kernel-by-kernel detail for a specific module type (one representative instance).
 
         Shows the full sequence of kernels in time order — the repetitive pattern within a layer.
@@ -968,10 +795,10 @@ class ReportGenerator:
             return
 
         # Pick the instance to show
-        if detail_instance is not None:
-            target = [m for m in matches if m.instance_id == detail_instance]
+        if module_index is not None:
+            target = [m for m in matches if m.instance_id == module_index]
             if not target:
-                print(f"\nInstance {detail_instance} not found for '{detail_module}'. "
+                print(f"\nInstance {module_index} not found for '{detail_module}'. "
                       f"Available: {sorted(set(m.instance_id for m in matches))}")
                 return
             selected = target[0]
@@ -1060,7 +887,7 @@ class ReportGenerator:
         return result
 
     def print_type_summary(self, stats_list: List[ModuleStats], mode: str,
-                           top_n_types: int = 3,
+                           max_detail_modules: int = 3,
                            detail_modules: Optional[List[str]] = None):
         """Print summary matching the Summary tab: metrics, categories, detail tabs."""
         grand_total = sum(
@@ -1075,7 +902,7 @@ class ReportGenerator:
         type_totals: Dict[str, float] = defaultdict(float)
         if not detail_modules:
             top_type_names, root_chains, type_totals, wrapper_types, type_children_map = \
-                self._select_detail_types(stats_list, mode, top_n_types)
+                self._select_max_detail_modules(stats_list, mode, max_detail_modules)
 
         # --- Section 1: Kernel Time Summary (with hierarchy) ---
         print("\n" + "=" * 90)
@@ -1127,8 +954,8 @@ class ReportGenerator:
             print(f"  {cat:<20s} {cnt:>8,d} {dur:>14,.1f} {avg:>12,.1f} {pct:>7.1f}%")
         print()
 
-    def _select_detail_types(self, stats_list: List[ModuleStats], mode: str,
-                             top_n_types: int) -> Tuple[set, Dict[str, List[str]],
+    def _select_max_detail_modules(self, stats_list: List[ModuleStats], mode: str,
+                             max_detail_modules: int) -> Tuple[set, Dict[str, List[str]],
                                                          Dict[str, float], set,
                                                          Dict[str, set]]:
         """Select detail tab types, prioritizing root chain leaves.
@@ -1164,7 +991,7 @@ class ReportGenerator:
 
         # Step 2: Fill remaining slots from sorted list
         for mtype, _ in sorted_types_flat:
-            if len(top_type_names) >= top_n_types:
+            if len(top_type_names) >= max_detail_modules:
                 break
             if mtype in skip_types:
                 continue
@@ -1190,9 +1017,8 @@ class ReportGenerator:
             self._collect_by_type_total(s.children_stats, agg, mode)
 
     def export_excel(self, stats_list: List[ModuleStats], mode: str,
-                     output_path: str, top_n_types: int = 3,
+                     output_path: str, max_detail_modules: int = 3,
                      detail_modules: Optional[List[str]] = None,
-                     config_path: Optional[str] = None,
                      model_info_roots: Optional[List[ModuleNode]] = None):
         """Export analysis to Excel workbook."""
         try:
@@ -1204,7 +1030,7 @@ class ReportGenerator:
             logger.error("openpyxl not installed. Run: pip install openpyxl")
             return
 
-        self.top_n_types = top_n_types
+        self.max_detail_modules = max_detail_modules
         wb = Workbook()
         header_font = Font(bold=True)
         header_fill = PatternFill(start_color="CCE5FF", end_color="CCE5FF", fill_type="solid")
@@ -1226,7 +1052,7 @@ class ReportGenerator:
             top_type_names = set(detail_modules)
         else:
             top_type_names, _, _, _, _ = \
-                self._select_detail_types(stats_list, mode, top_n_types)
+                self._select_max_detail_modules(stats_list, mode, max_detail_modules)
 
         # --- Summary tab (one-pager overview) ---
         ws_summary = wb.active
@@ -1409,7 +1235,7 @@ class ReportGenerator:
             png_dir = os.path.dirname(os.path.abspath(output_path))
             tmp_png = os.path.join(png_dir, "_arch_diagram_tmp.png")
             model_info_text, png_result = _generate_model_info(
-                model_info_roots, config_path=config_path,
+                model_info_roots,
                 png_path=tmp_png)
             if model_info_text:
                 self._write_model_info_tab(wb, model_info_text,
@@ -2003,26 +1829,20 @@ class ReportGenerator:
 class TraceModuleAnalyzer:
     """Main orchestrator: load trace, build module tree, correlate, aggregate, report."""
 
-    def __init__(self, trace_path: str, top_n: int = 5,
+    def __init__(self, trace_path: str,
                  output_path: Optional[str] = None,
                  detail_modules: Optional[List[str]] = None,
-                 detail_instance: Optional[int] = None,
-                 top_n_types: int = 3, show_tree: bool = False,
+                 module_index: Optional[int] = None,
+                 max_detail_modules: int = 3,
                  auto_fix_rocm: bool = True,
-                 config_path: Optional[str] = None,
-                 model_info: bool = True,
-                 collapse_layers: bool = True):
+                 model_info: bool = True):
         self.trace_path = trace_path
-        self.top_n = top_n
         self.output_path = output_path
         self.detail_modules = detail_modules or []
-        self.detail_instance = detail_instance
-        self.top_n_types = top_n_types
-        self.show_tree = show_tree
+        self.module_index = module_index
+        self.max_detail_modules = max_detail_modules
         self.auto_fix_rocm = auto_fix_rocm
-        self.config_path = config_path
         self.model_info = model_info
-        self.collapse_layers = collapse_layers
 
     def run(self):
         # Step 1: Load trace with single-pass categorization
@@ -2167,24 +1987,17 @@ class TraceModuleAnalyzer:
         # Step 6: Output
         reporter = ReportGenerator()
         reporter.print_type_summary(stats_list, mode,
-                                    top_n_types=self.top_n_types,
+                                    max_detail_modules=self.max_detail_modules,
                                     detail_modules=self.detail_modules)
 
         for dm in self.detail_modules:
             reporter.print_layer_detail(stats_list, mode, dm,
-                                        self.detail_instance)
-
-        if self.show_tree:
-            # Filter tree to detail modules if specified, otherwise show all
-            tree_filter = self.detail_modules[0] if self.detail_modules else None
-            reporter.print_hierarchy(stats_list, mode, tree_filter, self.top_n,
-                                     collapse=self.collapse_layers)
+                                        self.module_index)
 
         if self.output_path:
             reporter.export_excel(stats_list, mode, self.output_path,
-                                  top_n_types=self.top_n_types,
+                                  max_detail_modules=self.max_detail_modules,
                                   detail_modules=self.detail_modules,
-                                  config_path=self.config_path,
                                   model_info_roots=roots if self.model_info else None)
 
     def _propagate_phase(self, nodes: List[ModuleNode]):
@@ -2251,45 +2064,33 @@ def main():
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""\
 Examples:
-  # Diffusion trace (full mode — has kernel events)
-  python trace_module_analyzer.py wan2.2.trace.json.gz -o report.xlsx
+  # Generate an Excel report
+  python trace_module_analyzer.py trace.json.gz -o report.xlsx
 
-  # LLM trace (CPU-only mode — no kernel events)
-  python trace_module_analyzer.py deepseek.trace.json.gz -o report.xlsx
+  # Include detail sheets for up to 10 module types
+  python trace_module_analyzer.py trace.json.gz -o report.xlsx --max-detail-modules 10
 
-  # Enrich the Model Info tab with HuggingFace config (adds head counts, etc.)
-  python trace_module_analyzer.py trace.json.gz -o report.xlsx --config config.json
-
-  # Show kernel-by-kernel detail for a module type (repetitive pattern)
+  # Show kernel-by-kernel detail for a specific module type
   python trace_module_analyzer.py trace.json.gz --detail-module WanTransformerBlock
 
-  # Show specific instance
-  python trace_module_analyzer.py trace.json.gz --detail-module WanTransformerBlock --detail-instance 5
+  # Pick the 5th occurrence instead of the median
+  python trace_module_analyzer.py trace.json.gz --detail-module WanTransformerBlock --module-index 5
 
-  # Show full tree (optionally filtered by --detail-module)
-  python trace_module_analyzer.py trace.json.gz --show-tree
-  python trace_module_analyzer.py trace.json.gz --show-tree --detail-module WanDecoder3d
+
 """,
     )
     parser.add_argument("trace_file", help="Path to trace file (.json.gz or .json)")
     parser.add_argument("-o", "--output", dest="output", default=None,
-                        help="Output Excel file path (.xlsx)")
-    parser.add_argument("--top-n", type=int, default=5,
-                        help="Top N kernels to show per module (default: 5)")
-    parser.add_argument("--top-n-types", type=int, default=3,
-                        help="Top N module types for detail sheets (default: 3, 0=all)")
+                        help="Output Excel report path (.xlsx)")
+    parser.add_argument("--max-detail-modules", type=int, default=3,
+                        help="Number of module types to generate detail sheets for "
+                             "(default: 3, 0=all)")
     parser.add_argument("--detail-module", nargs="+", default=None,
-                        help="Show kernel-by-kernel detail for module type(s) "
+                        help="Specify module types for kernel-by-kernel detail "
                              "(e.g. --detail-module WanTransformerBlock FSDPT5Block)")
-    parser.add_argument("--detail-instance", type=int, default=None,
-                        help="Which instance to show detail for (default: 1)")
-    parser.add_argument("--show-tree", action="store_true",
-                        help="Print full module tree to console (verbose)")
-    parser.add_argument("--no-collapse", action="store_true",
-                        help="Disable collapsing of repeated layers in --show-tree")
-    parser.add_argument("--config", metavar="PATH", default=None,
-                        help="Path to HuggingFace config.json (enriches Model Info "
-                             "tab with head counts, vocab size, expert config, etc.)")
+    parser.add_argument("--module-index", type=int, default=None,
+                        help="Which occurrence of the module to show detail for "
+                             "(default: the instance closest to the median)")
     parser.add_argument("--no-rocm-fix", action="store_true",
                         help="Disable automatic ROCm trace fix (hipGraphLaunch flow events)")
     parser.add_argument("-v", "--verbose", action="store_true",
@@ -2311,15 +2112,11 @@ Examples:
     try:
         analyzer = TraceModuleAnalyzer(
             trace_path=args.trace_file,
-            top_n=args.top_n,
             output_path=output_path,
             detail_modules=args.detail_module,
-            detail_instance=args.detail_instance,
-            top_n_types=args.top_n_types if args.top_n_types > 0 else 999,
-            show_tree=args.show_tree,
-            collapse_layers=not args.no_collapse,
+            module_index=args.module_index,
+            max_detail_modules=args.max_detail_modules if args.max_detail_modules > 0 else 999,
             auto_fix_rocm=not args.no_rocm_fix,
-            config_path=args.config,
         )
         analyzer.run()
     except FileNotFoundError as e:
