@@ -20,28 +20,32 @@ Pipeline:
   TraceModuleAnalyzer   — Top-level orchestrator that chains all the above.
 
 PhaseDetector (prefill vs decode):
-  Two-tier approach — use explicit markers when available, fall back to heuristics.
+  Three-tier approach — use explicit function-call markers when available,
+  fall back to CUDA graph replay detection, then to keyword heuristics.
 
   1. Phase markers: During trace loading, scan python_function events for
-     forward_batch_info names. "is_extend" maps to prefill (SGLang terminology),
-     "is_decode" (excluding "is_decode_or_idle") maps to decode. Each marker
-     records (timestamp, phase, tid, pid).
+     SGLang's ModelRunner dispatch functions:
+       - "model_runner.py(...): forward_extend"  → prefill (duration span)
+       - "model_runner.py(...): forward_decode"  → decode  (duration span)
+     Each marker records (start_ts, end_ts, phase, tid, pid).
 
-  2. Tagging modules: For each module node, binary-search the sorted marker list
-     to find the most recent marker before the module's start time. That marker's
-     phase is assigned to the module. Children inherit their parent's phase since
-     a single forward pass is entirely prefill or entirely decode.
+     NOTE: We do NOT use forward_batch_info "is_extend"/"is_decode" events.
+     Those are boolean property checks on ForwardMode that fire during both
+     prefill and decode paths (e.g. inside init_new, attention backend init),
+     making them unreliable as phase indicators.
 
-     Example: if the marker list is [(t=100, decode), (t=500, prefill), (t=900, decode)]
-     and DeepseekV2Model_0 starts at t=520, bisect finds the t=500 "prefill" marker,
-     so the entire subtree (DeepseekV2DecoderLayer_0, DeepseekV2AttentionMLA_0,
-     RadixAttention_0, etc.) is tagged as prefill without re-searching each child.
+  2. Tagging modules: For each module node, check whether it falls within
+     any forward_extend or forward_decode time span. Children inherit their
+     parent's phase since a single forward pass is entirely prefill or decode.
 
-  3. Fallback (no markers): If the trace has no forward_batch_info markers
+  3. CUDA graph replay: CudaGraphReplay roots are always decode (hardcoded
+     at construction time in CudaGraphReplayHandler).
+
+  4. Fallback (no markers): If the trace has no model_runner markers
      (e.g. non-SGLang traces), scan each module's cpu_op event names and
      majority-vote on "prefill"/"extend" vs "decode" keywords.
 
-  4. Propagation: _propagate_phase pushes assigned phases down to any untagged
+  5. Propagation: _propagate_phase pushes assigned phases down to any untagged
      child nodes, ensuring every node in the tree has a phase label.
 """
 
@@ -447,20 +451,50 @@ class CudaGraphCorrelator:
                 templates[sig_len] = self._detect_layers(
                     names, skip_merge=has_distinct_half_layers)
 
+        # 3b. Classify each template as "target" or "draft" based on layer count.
+        # The target model's CUDA graph has many layers (e.g. 61 for DeepSeek V3);
+        # the MTP draft model's graph has very few (e.g. 1).
+        max_layers = max(len(b) for b in templates.values()) if templates else 0
+        template_is_target = {}
+        for sig_len, bounds in templates.items():
+            template_is_target[sig_len] = len(bounds) >= max(max_layers // 2, 2)
+
+        has_both = (any(template_is_target.values())
+                    and not all(template_is_target.values()))
+
         # 4. Build synthetic module trees for each replay
         new_roots = []
         matched = 0
-        replay_idx = 0
+        target_idx = 0
+        draft_idx = 0
         for corr in sorted(corr_to_events,
                            key=lambda c: corr_to_events[c][0].get("ts", 0)):
             evts = corr_to_events[corr]
             sig_len = len(evts)
             layer_bounds = templates.get(sig_len, [(0, sig_len, "unknown")])
+            is_target = template_is_target.get(sig_len, True)
+
+            if has_both:
+                if is_target:
+                    root_name = f"CudaGraphReplay_Target_{target_idx}"
+                    root_type = "CudaGraphReplay_Target"
+                    root_id = target_idx
+                    target_idx += 1
+                else:
+                    root_name = f"CudaGraphReplay_Draft_{draft_idx}"
+                    root_type = "CudaGraphReplay_Draft"
+                    root_id = draft_idx
+                    draft_idx += 1
+            else:
+                root_name = f"CudaGraphReplay_{target_idx + draft_idx}"
+                root_type = "CudaGraphReplay"
+                root_id = target_idx + draft_idx
+                target_idx += 1
 
             root = ModuleNode(
-                name=f"CudaGraphReplay_{replay_idx}",
-                module_type="CudaGraphReplay",
-                instance_id=replay_idx,
+                name=root_name,
+                module_type=root_type,
+                instance_id=root_id,
                 ts=evts[0].get("ts", 0),
                 end=evts[-1].get("ts", 0) + evts[-1].get("dur", 0),
                 tid=evts[0].get("tid", 0),
@@ -469,7 +503,7 @@ class CudaGraphCorrelator:
             root._phase = "decode"
 
             for layer_i, (start, end, label) in enumerate(layer_bounds):
-                if layer_i < len(capture_layer_names):
+                if is_target and layer_i < len(capture_layer_names):
                     layer_name = capture_layer_names[layer_i]
                 else:
                     layer_name = f"Layer_{layer_i}"
@@ -494,7 +528,9 @@ class CudaGraphCorrelator:
                 root.children.append(layer_node)
 
             new_roots.append(root)
-            replay_idx += 1
+
+        if has_both:
+            print(f"  CUDA graph sub-types: {target_idx} target, {draft_idx} draft")
 
         return new_roots, matched
 
@@ -766,64 +802,53 @@ class ModuleAggregator:
 # ---------------------------------------------------------------------------
 
 class PhaseDetector:
-    """Detect prefill vs decode phase for DeepseekV2Model forward passes."""
+    """Detect prefill vs decode phase using ModelRunner dispatch function spans.
+
+    Uses forward_extend / forward_decode time ranges from model_runner.py
+    python_function events. Each marker is (start_ts, end_ts, phase, tid, pid).
+    A module whose start time falls within a marker's [start, end] range is
+    assigned that phase. CUDA graph replays are always decode (set elsewhere).
+    """
 
     def detect_from_markers(self, roots: List[ModuleNode], phase_markers: List[Tuple]):
-        """Tag modules using pre-extracted phase markers (ts, phase, tid, pid)."""
+        """Tag modules using pre-extracted phase markers (start, end, phase, tid, pid)."""
         if not phase_markers:
             self._detect_from_cpu_ops(roots)
             return
-        phase_markers_sorted = sorted(phase_markers)
-        phase_markers_sorted = self._deduplicate_markers(phase_markers_sorted)
+        phase_markers_sorted = sorted(phase_markers, key=lambda m: m[0])
         self._tag_nodes_from_phases(roots, phase_markers_sorted)
-
-    @staticmethod
-    def _deduplicate_markers(markers: List[Tuple],
-                             window_us: float = 50.0) -> List[Tuple]:
-        """Deduplicate phase markers that come in close pairs.
-
-        SGLang's forward_batch_info checks both is_extend and is_decode on
-        every decoder layer for mixed batches, producing a prefill+decode
-        pair within microseconds.  Keep only the first marker in each pair
-        so that the batch's dominant phase (prefill for the traced forward
-        pass) is used.
-        """
-        if not markers:
-            return markers
-        deduped = [markers[0]]
-        for m in markers[1:]:
-            prev = deduped[-1]
-            if m[0] - prev[0] < window_us and m[1] != prev[1]:
-                continue
-            deduped.append(m)
-        return deduped
 
     def _tag_nodes_from_phases(self, nodes: List[ModuleNode], phases: List[Tuple],
                                parent_phase: Optional[str] = None,
                                is_root: bool = True,
-                               _phase_ts: Optional[List[float]] = None):
-        if _phase_ts is None:
-            _phase_ts = [p[0] for p in phases]
+                               _phase_starts: Optional[List[float]] = None):
+        if _phase_starts is None:
+            _phase_starts = [p[0] for p in phases]
         for node in nodes:
             if parent_phase:
-                # Children inherit parent phase — a forward pass is entirely
-                # prefill or decode; independent bisect on children can land on
-                # a stale marker when timestamps are close to a boundary.
                 node._phase = parent_phase  # type: ignore[attr-defined]
             elif not is_root:
-                idx = bisect.bisect_right(_phase_ts, node.ts) - 1
-                if 0 <= idx < len(phases):
-                    _, phase, _, _ = phases[idx]
+                phase = self._find_enclosing_phase(node.ts, phases, _phase_starts)
+                if phase:
                     node._phase = phase  # type: ignore[attr-defined]
-            # Root modules (e.g. Qwen3_5MoeForCausalLM) span the entire
-            # forward pass which may contain both prefill and decode batches.
-            # Don't assign them a phase; let each child bisect independently.
             child_phase = getattr(node, "_phase", None) if not is_root else None
             self._tag_nodes_from_phases(
                 node.children, phases,
                 parent_phase=child_phase,
                 is_root=False,
-                _phase_ts=_phase_ts)
+                _phase_starts=_phase_starts)
+
+    @staticmethod
+    def _find_enclosing_phase(ts: float, phases: List[Tuple],
+                              phase_starts: List[float]) -> Optional[str]:
+        """Find the phase marker whose [start, end] range contains *ts*."""
+        idx = bisect.bisect_right(phase_starts, ts) - 1
+        if idx < 0:
+            return None
+        start, end, phase, _, _ = phases[idx]
+        if start <= ts <= end:
+            return phase
+        return None
 
     def _detect_from_cpu_ops(self, nodes: List[ModuleNode]):
         """Fall back to checking cpu_op names for prefill/decode keywords."""
@@ -1038,6 +1063,7 @@ class ReportGenerator:
                 for s in rlist)
             pct = rtype_total / grand_total * 100 if grand_total > 0 else 0
             chain = root_chains.get(rtype, [rtype])
+            root_phase = self._infer_root_phase(rlist)
             print(f"  {rtype:<45s} {rtype_total:>14,.1f} {pct:>6.1f}%")
             if len(chain) > 1:
                 children = chain[1:]
@@ -1047,7 +1073,14 @@ class ReportGenerator:
                     ct = type_totals.get(ctype, 0)
                     ct_pct = ct / grand_total * 100 if grand_total > 0 else 0
                     label = f"    {connector}{ctype}"
-                    tab = ctype if ctype in top_type_names else ""
+                    if ctype in top_type_names:
+                        if root_phase:
+                            suffix = f" ({root_phase[:3]})"
+                            tab = f"{ctype[:28 - len(suffix)]}{suffix}"
+                        else:
+                            tab = ctype[:28]
+                    else:
+                        tab = ""
                     print(f"  {label:<45s} {ct:>14,.1f} {ct_pct:>6.1f}%  {tab}")
 
         # --- Section 2: Category breakdown ---
@@ -1136,6 +1169,29 @@ class ReportGenerator:
             time_val = s.total_kernel_time if mode == "full" else s.total_cpu_op_time
             agg[s.module_type] += time_val
             self._collect_by_type_total(s.children_stats, agg, mode)
+
+    @staticmethod
+    def _infer_root_phase(rlist: List[ModuleStats]) -> str:
+        """Return the dominant phase for a group of root-level stats.
+
+        Checks the root stats first; if they have no phase (common for
+        wrapper modules like DeepseekV2Model), falls back to the majority
+        phase of their immediate children.
+        """
+        for s in rlist:
+            p = getattr(s, "phase", "")
+            if p:
+                return p
+        from collections import Counter
+        child_phases = Counter()
+        for s in rlist:
+            for c in s.children_stats:
+                p = getattr(c, "phase", "")
+                if p:
+                    child_phases[p] += 1
+        if child_phases:
+            return child_phases.most_common(1)[0][0]
+        return ""
 
     def export_excel(self, stats_list: List[ModuleStats], mode: str,
                      output_path: str, max_detail_modules: int = 3,
@@ -1480,6 +1536,7 @@ class ReportGenerator:
                 for s in rlist)
             pct = rtype_total / grand_total * 100 if grand_total > 0 else 0
             chain = root_chains.get(rtype, [rtype])
+            root_phase = self._infer_root_phase(rlist)
             ws.cell(row=row, column=1, value=rtype)
             ws.cell(row=row, column=2, value=round(rtype_total, 1))
             ws.cell(row=row, column=3, value=f"{pct:.1f}%")
@@ -1495,7 +1552,12 @@ class ReportGenerator:
                     ws.cell(row=row, column=2, value=round(ct, 1))
                     ws.cell(row=row, column=3, value=f"{ct_pct:.1f}%")
                     if ctype in top_type_set:
-                        ws.cell(row=row, column=4, value=ctype)
+                        if root_phase:
+                            suffix = f" ({root_phase[:3]})"
+                            detail_ref = f"{ctype[:28 - len(suffix)]}{suffix}"
+                        else:
+                            detail_ref = ctype[:28]
+                        ws.cell(row=row, column=4, value=detail_ref)
                         for c in range(1, 5):
                             ws.cell(row=row, column=c).font = Font(bold=True)
                     row += 1
@@ -2097,11 +2159,13 @@ class TraceModuleAnalyzer:
                 name = e.get("name", "")
                 if name.startswith(MODULE_PREFIX) and e.get("dur") is not None:
                     module_events.append(e)
-                elif "forward_batch_info" in name:
-                    if "is_extend" in name:
-                        phase_markers.append((e["ts"], "prefill", e["tid"], e.get("pid")))
-                    elif "is_decode" in name and "is_decode_or_idle" not in name:
-                        phase_markers.append((e["ts"], "decode", e["tid"], e.get("pid")))
+                elif "model_runner" in name and e.get("dur") is not None:
+                    if ": forward_extend" in name:
+                        phase_markers.append((e["ts"], e["ts"] + e["dur"],
+                                              "prefill", e["tid"], e.get("pid")))
+                    elif ": forward_decode" in name:
+                        phase_markers.append((e["ts"], e["ts"] + e["dur"],
+                                              "decode", e["tid"], e.get("pid")))
 
         # Free the raw events list — we no longer need it
         del events
