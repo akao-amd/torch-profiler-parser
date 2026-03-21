@@ -2024,9 +2024,7 @@ class TraceModuleAnalyzer:
             reporter.print_layer_detail(stats_list, mode, dm,
                                         self.module_index)
 
-        # Always print model info to console when available
-        model_info_text = None
-        if roots:
+        if self.model_info and roots:
             model_info_text, _ = _generate_model_info(roots)
             if model_info_text:
                 print("\n" + "=" * 70)
