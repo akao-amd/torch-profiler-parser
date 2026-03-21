@@ -1865,7 +1865,7 @@ class TraceModuleAnalyzer:
                  module_index: Optional[int] = None,
                  max_detail_modules: int = 3,
                  auto_fix_rocm: bool = True,
-                 model_info: bool = True):
+                 model_info: bool = False):
         self.trace_path = trace_path
         self.output_path = output_path
         self.detail_modules = detail_modules or []
@@ -2024,6 +2024,16 @@ class TraceModuleAnalyzer:
             reporter.print_layer_detail(stats_list, mode, dm,
                                         self.module_index)
 
+        # Always print model info to console when available
+        model_info_text = None
+        if roots:
+            model_info_text, _ = _generate_model_info(roots)
+            if model_info_text:
+                print("\n" + "=" * 70)
+                print("  Model Info (from model_inspector)")
+                print("=" * 70)
+                print(model_info_text)
+
         if self.output_path:
             reporter.export_excel(stats_list, mode, self.output_path,
                                   max_detail_modules=self.max_detail_modules,
@@ -2106,7 +2116,8 @@ Examples:
   # Pick the 5th occurrence instead of the median
   python trace_module_analyzer.py trace.json.gz --detail-module WanTransformerBlock --module-index 5
 
-
+  # Include a Model Info tab with architecture summary from model_inspector
+  python trace_module_analyzer.py trace.json.gz -o report.xlsx --model-info
 """,
     )
     parser.add_argument("trace_file", help="Path to trace file (.json.gz or .json)")
@@ -2121,6 +2132,9 @@ Examples:
     parser.add_argument("--module-index", type=int, default=None,
                         help="Which occurrence of the module to show detail for "
                              "(default: the instance closest to the median)")
+    parser.add_argument("--model-info", action="store_true",
+                        help="Add a Model Info tab with architecture summary "
+                             "(requires model_inspector.py)")
     parser.add_argument("--no-rocm-fix", action="store_true",
                         help="Disable automatic ROCm trace fix (hipGraphLaunch flow events)")
     parser.add_argument("-v", "--verbose", action="store_true",
@@ -2147,6 +2161,7 @@ Examples:
             module_index=args.module_index,
             max_detail_modules=args.max_detail_modules if args.max_detail_modules > 0 else 999,
             auto_fix_rocm=not args.no_rocm_fix,
+            model_info=args.model_info,
         )
         analyzer.run()
     except FileNotFoundError as e:
