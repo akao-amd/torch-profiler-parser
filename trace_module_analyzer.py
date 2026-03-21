@@ -421,16 +421,21 @@ class CudaGraphCorrelator:
         for corr in corr_to_events:
             corr_to_events[corr].sort(key=lambda e: e.get("ts", 0))
 
-        # 2. Deduplicate into templates by kernel count (signature)
+        # 2. Extract capture-iteration layer names for naming (needed before
+        # template detection so we can skip half-layer merging when the
+        # capture iteration already has distinct half-layer module types).
+        capture_layer_names = self._extract_layer_names(capture_roots)
+        has_distinct_half_layers = self._has_distinct_half_layer_types(
+            capture_layer_names)
+
+        # 3. Deduplicate into templates by kernel count (signature)
         templates = {}  # sig_len -> layer boundaries [(start, end, label), ...]
         for corr, evts in corr_to_events.items():
             sig_len = len(evts)
             if sig_len not in templates:
                 names = [e.get("name", "") for e in evts]
-                templates[sig_len] = self._detect_layers(names)
-
-        # 3. Extract capture-iteration layer names for naming
-        capture_layer_names = self._extract_layer_names(capture_roots)
+                templates[sig_len] = self._detect_layers(
+                    names, skip_merge=has_distinct_half_layers)
 
         # 4. Build synthetic module trees for each replay
         new_roots = []
@@ -483,10 +488,14 @@ class CudaGraphCorrelator:
 
         return new_roots, matched
 
-    def _detect_layers(self, names):
+    def _detect_layers(self, names, skip_merge=False):
         """COMM-based segmentation + half-layer merging.
 
         Returns [(start_idx, end_idx, type_label), ...].
+
+        skip_merge: when True, never merge half-layers.  Used when the
+        capture iteration already has distinct module types for each half
+        (e.g. Qwen3_5AttentionDecoderLayer + Qwen3_5LinearDecoderLayer).
         """
         cats = [self._quick_cat(n) for n in names]
         comm_pos = [i for i, c in enumerate(cats) if c == "COMM"]
@@ -504,6 +513,9 @@ class CudaGraphCorrelator:
         if prev < len(cats):
             seg = cats[prev:]
             segments.append((prev, len(cats), "ATTN" in seg, "MOE" in seg))
+
+        if skip_merge:
+            return [(s[0], s[1], self._seg_label(s[2], s[3])) for s in segments]
 
         # Decide: half-layer vs full-layer model
         attn_only = sum(1 for s in segments if s[2] and not s[3])
@@ -560,6 +572,22 @@ class CudaGraphCorrelator:
                         or "TransformerBlock" in child.module_type):
                     names.append(child.name)
         return names
+
+    @staticmethod
+    def _has_distinct_half_layer_types(layer_names):
+        """Check if capture layer names contain multiple distinct DecoderLayer types.
+
+        Models like Qwen3.5 split each transformer layer into two separate
+        nn.Module types (AttentionDecoderLayer + LinearDecoderLayer).  When
+        this is the case, the CUDA graph segmentation should NOT merge
+        adjacent half-layers, because each half already has its own module
+        identity from the capture iteration.
+        """
+        types = set()
+        for name in layer_names:
+            m = re.match(r"^(.+?)_(\d+)$", name)
+            types.add(m.group(1) if m else name)
+        return len(types) > 1
 
 
 # ---------------------------------------------------------------------------
@@ -1964,6 +1992,11 @@ class TraceModuleAnalyzer:
         self.model_info = model_info
 
     def run(self):
+        import time as _time
+        _t0 = _time.monotonic()
+        def _elapsed():
+            return f"[{_time.monotonic() - _t0:.1f}s]"
+
         # Step 1: Load trace with single-pass categorization
         print(f"Loading trace: {self.trace_path}")
         data = self._load_trace(self.trace_path)
@@ -2032,6 +2065,7 @@ class TraceModuleAnalyzer:
         print(f"  Mode: {mode}")
 
         # Step 2: Build module hierarchy tree
+        print(f"  {_elapsed()} event categorization done")
         if not module_events:
             print("\nWARNING: No nn.Module events found. Trace may not have been captured "
                   "with `with_modules=True`.")
@@ -2055,6 +2089,7 @@ class TraceModuleAnalyzer:
             print(f"    ... and {len(roots) - 10} more")
 
         # Step 3: Correlate compute events → modules
+        print(f"  {_elapsed()} module hierarchy built")
         if mode == "full":
             print("\nBuilding cpu_op shape index for Input Dims...")
             shape_index = CpuOpShapeIndex(cpu_ops, runtime_events, driver_events)
@@ -2091,18 +2126,21 @@ class TraceModuleAnalyzer:
             print(f"  Matched {matched:,} / {len(cpu_ops):,} cpu_ops to modules")
             del cpu_ops
 
+        print(f"  {_elapsed()} correlation done")
         # Step 4: Detect prefill vs decode phase
         phase_detector = PhaseDetector()
         phase_detector.detect_from_markers(roots, phase_markers)
         self._propagate_phase(roots)
 
         # Step 5: Aggregate stats
+        print(f"  {_elapsed()} phase detection done")
         print("\nAggregating module statistics...")
         aggregator = ModuleAggregator()
         stats_list = aggregator.aggregate(roots, mode)
         # Propagate phase from nodes
         self._copy_phase_to_stats(roots, stats_list)
 
+        print(f"  {_elapsed()} aggregation done")
         # Step 6: Output
         reporter = ReportGenerator()
         reporter.print_type_summary(stats_list, mode,
@@ -2121,11 +2159,13 @@ class TraceModuleAnalyzer:
                 print("=" * 70)
                 print(model_info_text)
 
+        print(f"  {_elapsed()} console output done")
         if self.output_path:
             reporter.export_excel(stats_list, mode, self.output_path,
                                   max_detail_modules=self.max_detail_modules,
                                   detail_modules=self.detail_modules,
                                   model_info_roots=roots if self.model_info else None)
+            print(f"  {_elapsed()} excel export done")
 
     def _propagate_phase(self, nodes: List[ModuleNode]):
         """Propagate phase from parent to children if not set."""
