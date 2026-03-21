@@ -723,10 +723,33 @@ class PhaseDetector:
             self._detect_from_cpu_ops(roots)
             return
         phase_markers_sorted = sorted(phase_markers)
+        phase_markers_sorted = self._deduplicate_markers(phase_markers_sorted)
         self._tag_nodes_from_phases(roots, phase_markers_sorted)
 
+    @staticmethod
+    def _deduplicate_markers(markers: List[Tuple],
+                             window_us: float = 50.0) -> List[Tuple]:
+        """Deduplicate phase markers that come in close pairs.
+
+        SGLang's forward_batch_info checks both is_extend and is_decode on
+        every decoder layer for mixed batches, producing a prefill+decode
+        pair within microseconds.  Keep only the first marker in each pair
+        so that the batch's dominant phase (prefill for the traced forward
+        pass) is used.
+        """
+        if not markers:
+            return markers
+        deduped = [markers[0]]
+        for m in markers[1:]:
+            prev = deduped[-1]
+            if m[0] - prev[0] < window_us and m[1] != prev[1]:
+                continue
+            deduped.append(m)
+        return deduped
+
     def _tag_nodes_from_phases(self, nodes: List[ModuleNode], phases: List[Tuple],
-                               parent_phase: Optional[str] = None):
+                               parent_phase: Optional[str] = None,
+                               is_root: bool = True):
         phase_ts = [p[0] for p in phases]
         for node in nodes:
             if parent_phase:
@@ -734,14 +757,19 @@ class PhaseDetector:
                 # prefill or decode; independent bisect on children can land on
                 # a stale marker when timestamps are close to a boundary.
                 node._phase = parent_phase  # type: ignore[attr-defined]
-            else:
+            elif not is_root:
                 idx = bisect.bisect_right(phase_ts, node.ts) - 1
                 if 0 <= idx < len(phases):
                     _, phase, _, _ = phases[idx]
                     node._phase = phase  # type: ignore[attr-defined]
+            # Root modules (e.g. Qwen3_5MoeForCausalLM) span the entire
+            # forward pass which may contain both prefill and decode batches.
+            # Don't assign them a phase; let each child bisect independently.
+            child_phase = getattr(node, "_phase", None) if not is_root else None
             self._tag_nodes_from_phases(
                 node.children, phases,
-                parent_phase=getattr(node, "_phase", None))
+                parent_phase=child_phase,
+                is_root=False)
 
     def _detect_from_cpu_ops(self, nodes: List[ModuleNode]):
         """Fall back to checking cpu_op names for prefill/decode keywords."""
@@ -958,13 +986,13 @@ class ReportGenerator:
             chain = root_chains.get(rtype, [rtype])
             print(f"  {rtype:<45s} {rtype_total:>14,.1f} {pct:>6.1f}%")
             if len(chain) > 1:
-                for i, ctype in enumerate(chain[1:], 1):
-                    is_last = (i == len(chain) - 1)
+                children = chain[1:]
+                for i, ctype in enumerate(children):
+                    is_last = (i == len(children) - 1)
                     connector = "└── " if is_last else "├── "
-                    indent = "    " * i
                     ct = type_totals.get(ctype, 0)
                     ct_pct = ct / grand_total * 100 if grand_total > 0 else 0
-                    label = f"{indent}{connector}{ctype}"
+                    label = f"    {connector}{ctype}"
                     tab = ctype if ctype in top_type_names else ""
                     print(f"  {label:<45s} {ct:>14,.1f} {ct_pct:>6.1f}%  {tab}")
 
@@ -1008,16 +1036,25 @@ class ReportGenerator:
                 rtype, wrapper_types, type_children_map, stats_list, mode)
             root_chains[rtype] = chain
 
-        # Step 1: Reserve slots for each root chain's leaf
+        # Step 1: Reserve slots for each root chain's leaves.
+        # A chain may have multiple leaves when a wrapper has several
+        # significant child types (e.g. LinearDecoderLayer + AttentionDecoderLayer).
+        # Chain leaves are the last element(s) — they get detail tabs even if
+        # they are technically wrappers themselves.
         top_type_names: set = set()
         skip_types: set = set(wrapper_types)
         for rtype in root_types:
             chain = root_chains[rtype]
-            leaf = chain[-1]
-            if leaf not in skip_types and leaf not in top_type_names:
-                top_type_names.add(leaf)
-                desc = self._all_descendant_types(leaf, type_children_map)
-                skip_types.update(desc)
+            if len(chain) <= 1:
+                continue
+            # All chain elements after the root are candidate leaves
+            leaves = chain[1:]
+            for leaf in leaves:
+                if leaf not in top_type_names:
+                    top_type_names.add(leaf)
+                    skip_types.discard(leaf)
+                    desc = self._all_descendant_types(leaf, type_children_map)
+                    skip_types.update(desc)
 
         # Step 2: Fill remaining slots from sorted list
         for mtype, _ in sorted_types_flat:
@@ -1387,13 +1424,13 @@ class ReportGenerator:
             ws.cell(row=row, column=3, value=f"{pct:.1f}%")
             row += 1
             if len(chain) > 1:
-                for i, ctype in enumerate(chain[1:], 1):
-                    is_last = (i == len(chain) - 1)
+                children = chain[1:]
+                for i, ctype in enumerate(children):
+                    is_last = (i == len(children) - 1)
                     connector = "└── " if is_last else "├── "
-                    indent = "    " * i
                     ct = type_totals.get(ctype, 0)
                     ct_pct = ct / grand_total * 100 if grand_total > 0 else 0
-                    ws.cell(row=row, column=1, value=f"{indent}{connector}{ctype}")
+                    ws.cell(row=row, column=1, value=f"    {connector}{ctype}")
                     ws.cell(row=row, column=2, value=round(ct, 1))
                     ws.cell(row=row, column=3, value=f"{ct_pct:.1f}%")
                     if ctype in top_type_set:
@@ -1686,10 +1723,21 @@ class ReportGenerator:
         type accounts for >threshold of its total time.  These are skipped in
         auto-selection to prefer the smaller repetitive unit.
         Applies transitively: if A wraps B wraps C, both A and B are skipped.
+
+        Also treats a type as a wrapper if it has very few instances (<=2) and
+        its children collectively account for >threshold of its time with at
+        least one child type having multiple instances (the repetitive unit).
+        This handles models like Qwen3_5MoeForCausalLM which has two child
+        decoder layer types (Linear + Attention) that together account for
+        nearly all the time.
         """
         # Collect one representative per type (first instance seen)
         reps: Dict[str, ModuleStats] = {}
         ReportGenerator._collect_first_instance(stats_list, reps)
+
+        # Count instances per type across the tree
+        type_counts: Dict[str, int] = defaultdict(int)
+        ReportGenerator._count_instances(stats_list, type_counts)
 
         skip: set = set()
         for mtype, rep in reps.items():
@@ -1702,10 +1750,26 @@ class ReportGenerator:
             for c in rep.children_stats:
                 ct = c.total_kernel_time if mode == "full" else c.total_cpu_op_time
                 child_by_type[c.module_type] += ct
+
+            # Original check: single dominant child
             for ctype, ctime in child_by_type.items():
                 if ctime / parent_time > threshold:
                     skip.add(mtype)
                     break
+
+            if mtype in skip:
+                continue
+
+            # Additional check: non-repetitive parent (<=2 instances) whose
+            # children collectively dominate and include repetitive types.
+            if type_counts.get(mtype, 0) <= 2:
+                total_child_time = sum(child_by_type.values())
+                has_repetitive_child = any(
+                    type_counts.get(ct, 0) > 2 for ct in child_by_type)
+                if (total_child_time / parent_time > threshold
+                        and has_repetitive_child):
+                    skip.add(mtype)
+
         return skip
 
     @staticmethod
@@ -1716,6 +1780,14 @@ class ReportGenerator:
             if s.module_type not in out:
                 out[s.module_type] = s
             ReportGenerator._collect_first_instance(s.children_stats, out)
+
+    @staticmethod
+    def _count_instances(stats_list: List[ModuleStats],
+                         out: Dict[str, int]):
+        """Count total instances of each module type across the tree."""
+        for s in stats_list:
+            out[s.module_type] += 1
+            ReportGenerator._count_instances(s.children_stats, out)
 
     @staticmethod
     def _build_type_children(stats_list: List[ModuleStats]) -> Dict[str, set]:
@@ -1756,7 +1828,12 @@ class ReportGenerator:
                                   type_children: Dict[str, set],
                                   stats_list: List[ModuleStats],
                                   mode: str) -> List[str]:
-        """Follow wrapper chain, returning the full list [mtype, child, ..., leaf]."""
+        """Follow wrapper chain, returning the full list [mtype, child, ..., leaf].
+
+        When a wrapper has multiple significant child types (e.g.
+        Qwen3_5MoeForCausalLM with LinearDecoderLayer + AttentionDecoderLayer),
+        all significant children are included in the chain.
+        """
         reps: Dict[str, ModuleStats] = {}
         ReportGenerator._collect_first_instance(stats_list, reps)
         chain = [mtype]
@@ -1771,9 +1848,21 @@ class ReportGenerator:
             for c in rep.children_stats:
                 ct = c.total_kernel_time if mode == "full" else c.total_cpu_op_time
                 child_by_type[c.module_type] += ct
-            best_child = max(child_by_type, key=child_by_type.get)
-            chain.append(best_child)
-            current = best_child
+            parent_time = (rep.total_kernel_time if mode == "full"
+                           else rep.total_cpu_op_time)
+            # Include all child types that account for >10% of parent time
+            significant = sorted(
+                ((ct, cname) for cname, ct in child_by_type.items()
+                 if parent_time > 0 and ct / parent_time > 0.10),
+                reverse=True)
+            if not significant:
+                break
+            if len(significant) > 1:
+                for _, cname in significant:
+                    chain.append(cname)
+                break  # multi-child wrapper: don't recurse further
+            chain.append(significant[0][1])
+            current = significant[0][1]
         return chain
 
     def _find_median_instance_per_type(self, stats_list: List[ModuleStats],
