@@ -9,9 +9,9 @@ Built for analyzing large model inference (LLMs, diffusion models, MoE architect
 | Tool | Description |
 |------|-------------|
 | `trace_module_analyzer.py` | Primary trace parser. Correlates CPU module spans with GPU kernels to produce per-module kernel breakdown reports. |
+| `visualize_module_tree.py` | Interactive HTML module tree visualizer. Reads `analysis.xlsx` and generates a self-contained HTML with tree-table and architecture diagram views. Used by `--model-info`. |
 | `compare_analysis.py` | Action-oriented diff of two `analysis.xlsx` reports. Detects kernel replacements, same-kernel time changes, and per-category drill-down. |
 | `kernel_categories.csv` | Editable kernel classification rules. Each row maps a regex pattern to a category (e.g. attention, gemm, communication). |
-| `model_inspector.py` | Static model structure analysis and trace-based architecture diagrams. Used by `--model-info`. |
 | `kernel_projection.py` | Project kernel-level improvements to estimate TTFT/ITL impact. |
 | `evaluate_module_parsing.py` | Evaluates trace parsing quality with structural scoring (S1-S4). |
 | `fix_rocm_trace_flow.py` | Fixes missing CUDA-graph flow events in ROCm traces. Auto-applied by the analyzer. |
@@ -35,8 +35,14 @@ python3 trace_module_analyzer.py trace.json.gz --detail-module WanTransformerBlo
 # Pick the 5th occurrence instead of the median
 python3 trace_module_analyzer.py trace.json.gz --detail-module WanTransformerBlock --module-index 5
 
-# Include a Model Info tab with architecture summary
-python3 trace_module_analyzer.py trace.json.gz -o report.xlsx --model-info
+# Generate interactive module tree HTML and serve it
+python3 trace_module_analyzer.py trace.json.gz --model-info
+
+# With Excel report + visualization on custom port
+python3 trace_module_analyzer.py trace.json.gz -o report.xlsx --model-info --port 9000
+
+# Standalone: generate HTML from an existing analysis.xlsx
+python3 visualize_module_tree.py analysis.xlsx --serve
 
 # Evaluate parsing quality
 python3 evaluate_module_parsing.py report.xlsx --json
@@ -51,7 +57,8 @@ python3 evaluate_module_parsing.py report.xlsx --json
 | `--max-detail-modules` | 3 | Number of module types to generate detail sheets for (0=all) |
 | `--detail-module` | None | Specify module types for kernel-by-kernel detail |
 | `--module-index` | median | Which occurrence of the module to show detail for |
-| `--model-info` | off | Add a Model Info tab with architecture summary |
+| `--model-info` | off | Generate interactive module tree HTML and start HTTP server |
+| `--port` | 8765 | HTTP server port for `--model-info` |
 | `--no-rocm-fix` | off | Disable automatic ROCm trace fix |
 | `-v`, `--verbose` | off | Enable debug logging |
 
@@ -92,7 +99,7 @@ To add a new pattern, append `|yourpattern` to the relevant row. To add a new ca
 
 - Python 3.8+
 - `openpyxl` (for Excel report generation)
-- `matplotlib` (optional, for architecture diagram PNG in `--model-info`)
+- `fastapi` + `uvicorn` (optional, for `--model-info` HTTP server; falls back to stdlib `http.server`)
 
 ## Documentation
 
