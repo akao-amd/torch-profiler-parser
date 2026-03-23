@@ -103,11 +103,11 @@ class KernelDetail:
     of instances for large traces).
     """
     __slots__ = ("name", "duration", "category", "module_path",
-                 "ts", "phase", "input_dims")
+                 "ts", "phase", "input_dims", "source_path")
 
     def __init__(self, name: str, duration: float, category: str,
                  module_path: str, ts: float = 0.0, phase: str = "",
-                 input_dims: str = ""):
+                 input_dims: str = "", source_path: str = ""):
         self.name = name
         self.duration = duration
         self.category = category
@@ -115,6 +115,7 @@ class KernelDetail:
         self.ts = ts
         self.phase = phase
         self.input_dims = input_dims
+        self.source_path = source_path
 
 
 @dataclass
@@ -337,6 +338,134 @@ class CpuOpShapeIndex:
         return str(non_empty)
 
 
+class PythonSourceIndex:
+    """Map correlation IDs to the Python source location of each kernel launch.
+
+    For each cuda_runtime/cuda_driver launch event, finds the narrowest
+    enclosing python_function event whose name contains a ``.py(`` source
+    reference (e.g. ``sglang/srt/layers/attention/fla/chunk.py(26):
+    chunk_gated_delta_rule_fwd``).
+
+    Falls back to a cleaned-up ``<built-in method NAME ...>`` if no ``.py``
+    source is found in the enclosing stack.
+    """
+
+    _BUILTIN_RE = re.compile(
+        r"<built-in (?:method|function) (\S+)")
+    _FRAMEWORK_PREFIXES = (
+        "torch/", "threading.py", "multiprocessing/",
+        "<string>", "tqdm/", "importlib/", "contextlib.py",
+    )
+    _WRAPPER_RE = re.compile(
+        r":\s*(?:wrapper|custom_wrapper|outer_wrapper|wrapper_custom"
+        r"|__call__|_call_impl|<lambda>|<module>|<genexpr>"
+        r"|decorate_context|decorate_fwd|run)\s*$"
+    )
+
+    def __init__(self, pyfunc_events: List[Dict], runtime_events: List[Dict],
+                 driver_events: Optional[List[Dict]] = None):
+        pf_intervals: Dict[Tuple[int, int], List[Tuple[float, float, str]]] = defaultdict(list)
+        for e in pyfunc_events:
+            dur = e.get("dur")
+            if dur is None or dur < 1.0:
+                continue
+            ts = e["ts"]
+            tid = e["tid"]
+            pid = e.get("pid", tid)
+            pf_intervals[(pid, tid)].append((ts, ts + dur, e.get("name", "")))
+
+        for key in pf_intervals:
+            pf_intervals[key].sort(key=lambda x: (x[0], -x[1]))
+        self._intervals = pf_intervals
+        self._starts_cache: Dict[Tuple[int, int], List[float]] = {
+            k: [iv[0] for iv in v] for k, v in pf_intervals.items()
+        }
+
+        self._corr_to_source: Dict[int, str] = {}
+        all_launches = list(runtime_events)
+        if driver_events:
+            all_launches.extend(driver_events)
+        for e in all_launches:
+            corr = e.get("args", {}).get("correlation")
+            if corr is None or corr in self._corr_to_source:
+                continue
+            ts = e["ts"]
+            tid = e["tid"]
+            pid = e.get("pid", tid)
+            src = self._find_source(ts, pid, tid)
+            if src:
+                self._corr_to_source[corr] = src
+
+    def get_source(self, correlation_id: int) -> str:
+        return self._corr_to_source.get(correlation_id, "")
+
+    def _find_source(self, ts: float, pid: int, tid: int) -> str:
+        """Find the best Python source location enclosing *ts*.
+
+        Four-tier preference (narrowest wins within each tier):
+          1. App-level ``.py(`` frames — not framework, not wrapper/dispatch
+          2. App-level ``.py(`` frames — not framework (wrapper allowed)
+          3. Any ``.py(`` frame (including framework internals)
+          4. ``<built-in method/function NAME ...>`` with pybind11 noise stripped
+        """
+        key = (pid, tid)
+        intervals = self._intervals.get(key)
+        if not intervals:
+            return ""
+        starts = self._starts_cache[key]
+        idx = bisect.bisect_right(starts, ts) - 1
+
+        best_app = ""
+        best_app_span = float("inf")
+        best_app_wrap = ""
+        best_app_wrap_span = float("inf")
+        best_any_py = ""
+        best_any_py_span = float("inf")
+        best_fallback = ""
+        best_fb_span = float("inf")
+
+        fw_prefixes = self._FRAMEWORK_PREFIXES
+        wrapper_re = self._WRAPPER_RE
+
+        lo = max(0, idx - 80)
+        hi = min(len(intervals), idx + 10)
+        for i in range(lo, hi):
+            s, e, name = intervals[i]
+            if s <= ts <= e:
+                span = e - s
+                if ".py(" in name:
+                    is_framework = name.startswith(fw_prefixes)
+                    is_wrapper = bool(wrapper_re.search(name))
+                    if not is_framework:
+                        if not is_wrapper and span < best_app_span:
+                            best_app_span = span
+                            best_app = name
+                        if span < best_app_wrap_span:
+                            best_app_wrap_span = span
+                            best_app_wrap = name
+                    if span < best_any_py_span:
+                        best_any_py_span = span
+                        best_any_py = name
+                elif span < best_fb_span:
+                    best_fb_span = span
+                    best_fallback = name
+            elif s > ts + 100:
+                break
+
+        if best_app:
+            return best_app
+        if best_app_wrap:
+            return best_app_wrap
+        if best_any_py:
+            return best_any_py
+        if best_fallback:
+            m = self._BUILTIN_RE.match(best_fallback)
+            if m:
+                return f"<built-in {m.group(1)}>"
+            return best_fallback
+        return ""
+
+
 class KernelCorrelator:
     """Map GPU kernels to modules via correlation ID chain."""
 
@@ -360,7 +489,8 @@ class KernelCorrelator:
         self._index = _IntervalIndex(roots)
 
     def correlate(self, kernel_events: List[Dict], roots: List[ModuleNode],
-                  shape_index: Optional["CpuOpShapeIndex"] = None) -> int:
+                  shape_index: Optional["CpuOpShapeIndex"] = None,
+                  source_index: Optional["PythonSourceIndex"] = None) -> int:
         """Assign each kernel to its deepest enclosing module. Returns count matched."""
         matched = 0
         for k in kernel_events:
@@ -377,6 +507,8 @@ class KernelCorrelator:
             if module is not None:
                 if shape_index is not None:
                     k["_input_dims"] = shape_index.get_shape(corr)
+                if source_index is not None:
+                    k["_source_path"] = source_index.get_source(corr)
                 k["_matched"] = True
                 module.kernels.append(k)
                 matched += 1
@@ -757,7 +889,8 @@ class ModuleAggregator:
             stats.kernel_details.append(KernelDetail(
                 name=kname, duration=dur, category=cat,
                 module_path=path, ts=k.get("ts", 0), phase=node_phase,
-                input_dims=k.get("_input_dims", "")))
+                input_dims=k.get("_input_dims", ""),
+                source_path=k.get("_source_path", "")))
 
         # Direct cpu_op stats
         for op in node.cpu_ops:
@@ -1389,7 +1522,8 @@ class ReportGenerator:
 
             # Kernel detail headers
             det_headers = ["Module", "Input Dims", "Kernel Name",
-                          "Duration (us)", "% of wall time", "Category"]
+                          "Duration (us)", "% of wall time", "Category",
+                          "Path"]
             for col, h in enumerate(det_headers, 1):
                 cell = ws_det.cell(row=cur_row, column=col, value=h)
                 cell.font = header_font
@@ -1405,6 +1539,7 @@ class ReportGenerator:
                 ws_det.cell(row=cur_row, column=4, value=round(d.duration, 1))
                 ws_det.cell(row=cur_row, column=5, value=round(pct, 1))
                 ws_det.cell(row=cur_row, column=6, value=d.category)
+                ws_det.cell(row=cur_row, column=7, value=d.source_path)
                 cur_row += 1
             if detail_truncated:
                 ws_det.cell(row=cur_row, column=1,
@@ -1412,6 +1547,7 @@ class ReportGenerator:
             ws_det.column_dimensions["A"].width = 35
             ws_det.column_dimensions["B"].width = 60
             ws_det.column_dimensions["C"].width = 80
+            ws_det.column_dimensions["G"].width = 80
 
         # --- Model Info tab (architecture text + diagram from trace roots) ---
         tmp_png = None
@@ -2136,6 +2272,7 @@ class TraceModuleAnalyzer:
         driver_events = []
         cpu_ops = []
         module_events = []  # pre-filtered nn.Module events
+        pyfunc_events = []  # non-module python_function events (for source path)
         gpu_memcpy = []
         gpu_memset = []
         phase_markers = []  # (ts, phase, tid, pid) for prefill/decode detection
@@ -2159,13 +2296,16 @@ class TraceModuleAnalyzer:
                 name = e.get("name", "")
                 if name.startswith(MODULE_PREFIX) and e.get("dur") is not None:
                     module_events.append(e)
-                elif "model_runner" in name and e.get("dur") is not None:
-                    if ": forward_extend" in name:
-                        phase_markers.append((e["ts"], e["ts"] + e["dur"],
-                                              "prefill", e["tid"], e.get("pid")))
-                    elif ": forward_decode" in name:
-                        phase_markers.append((e["ts"], e["ts"] + e["dur"],
-                                              "decode", e["tid"], e.get("pid")))
+                else:
+                    if e.get("dur") is not None:
+                        pyfunc_events.append(e)
+                    if "model_runner" in name and e.get("dur") is not None:
+                        if ": forward_extend" in name:
+                            phase_markers.append((e["ts"], e["ts"] + e["dur"],
+                                                  "prefill", e["tid"], e.get("pid")))
+                        elif ": forward_decode" in name:
+                            phase_markers.append((e["ts"], e["ts"] + e["dur"],
+                                                  "decode", e["tid"], e.get("pid")))
 
         # Free the raw events list — we no longer need it
         del events
@@ -2178,6 +2318,7 @@ class TraceModuleAnalyzer:
         print(f"  cuda_driver events: {len(driver_events):,}")
         print(f"  cpu_op events: {len(cpu_ops):,}")
         print(f"  nn.Module events: {len(module_events):,}")
+        print(f"  python_function events: {len(pyfunc_events):,}")
         print(f"  gpu_memcpy events: {len(gpu_memcpy):,}")
         print(f"  gpu_memset events: {len(gpu_memset):,}")
         print(f"  phase markers: {len(phase_markers):,}")
@@ -2214,6 +2355,11 @@ class TraceModuleAnalyzer:
             shape_index = CpuOpShapeIndex(cpu_ops, runtime_events, driver_events)
             print(f"  Indexed {len(shape_index._corr_to_shape):,} correlation→shape mappings")
 
+            print("Building python source index for kernel source paths...")
+            source_index = PythonSourceIndex(pyfunc_events, runtime_events, driver_events)
+            print(f"  Indexed {len(source_index._corr_to_source):,} correlation→source mappings")
+            del pyfunc_events  # free memory
+
             print("Correlating kernels to modules via cuda_runtime + cuda_driver...")
             all_gpu_events = kernel_events + gpu_memcpy + gpu_memset
             correlator = KernelCorrelator(runtime_events, roots,
@@ -2221,8 +2367,9 @@ class TraceModuleAnalyzer:
             graph_correlator = CudaGraphCorrelator(runtime_events)
             del runtime_events, driver_events  # free memory
             matched = correlator.correlate(all_gpu_events, roots,
-                                           shape_index=shape_index)
-            del shape_index  # free memory
+                                           shape_index=shape_index,
+                                           source_index=source_index)
+            del shape_index, source_index  # free memory
             print(f"  Matched {matched:,} / {len(all_gpu_events):,} GPU events to modules")
 
             # Step 3b: CUDA graph replay correlation
@@ -2239,7 +2386,7 @@ class TraceModuleAnalyzer:
                           f"{len(all_gpu_events):,} GPU events")
         else:
             print("\nCorrelating cpu_ops to modules via time containment...")
-            del runtime_events, driver_events
+            del runtime_events, driver_events, pyfunc_events
             correlator = CpuOpCorrelator(roots)
             matched = correlator.correlate(cpu_ops, roots)
             print(f"  Matched {matched:,} / {len(cpu_ops):,} cpu_ops to modules")
