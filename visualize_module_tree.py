@@ -284,7 +284,17 @@ def _detect_repeating_pattern(type_seq: List[str]):
                 if best is None or coverage > best[0]:
                     best = (coverage, pattern, repeats, start, start + coverage)
     if best:
-        return best[1], best[2], best[3], best[4]
+        coverage, pattern, repeats, start_idx, end_idx = best
+        plen = len(pattern)
+        distinct = len(set(pattern))
+        # Reject degenerate patterns:
+        # - Single-type patterns (e.g. [Norm, Norm]) that cover few elements
+        # - Patterns where total children are too few for folding to help
+        if distinct == 1 and (coverage <= 3 or n <= 6):
+            return None
+        if coverage < n * 0.5 and coverage <= 3:
+            return None
+        return pattern, repeats, start_idx, end_idx
     return None
 
 
