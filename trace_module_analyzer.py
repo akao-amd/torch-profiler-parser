@@ -859,6 +859,222 @@ def _categorize_cpu_op(name: str) -> str:
     return "other"
 
 
+def _parse_dims_literal(dims_str: str):
+    """Parse Input Dims string from trace (list-of-lists repr) for FLOP heuristics."""
+    if not dims_str or not isinstance(dims_str, str):
+        return None
+    s = dims_str.strip()
+    if not s.startswith("["):
+        return None
+    try:
+        import ast
+        return ast.literal_eval(s)
+    except Exception:
+        pass
+    try:
+        return json.loads(s)
+    except Exception:
+        return None
+
+
+def _try_gemm_flops(a: list, b: list) -> float:
+    """Try to compute 2*M*K*N from a pair of 2D or 3D tensor shapes.
+
+    Handles both row-major [M,K]@[K,N] and column-major weight [M,K]@[N,K]
+    (transposed), as well as batched variants [B,M,K]@[B,K,N] / [B,M,K]@[B,N,K].
+    Returns NaN if shapes don't look like a matmul pair.
+    """
+    try:
+        if len(a) == 2 and len(b) == 2:
+            M, K = float(a[0]), float(a[1])
+            if a[1] == b[0]:        # [M,K] @ [K,N]
+                return 2.0 * M * K * float(b[1])
+            if a[1] == b[1]:        # [M,K] @ [N,K]  (weight transposed)
+                return 2.0 * M * K * float(b[0])
+        if len(a) == 3 and len(b) == 3 and a[0] == b[0]:
+            B, M, K = float(a[0]), float(a[1]), float(a[2])
+            if a[2] == b[1]:        # [B,M,K] @ [B,K,N]
+                return 2.0 * B * M * K * float(b[2])
+            if a[2] == b[2]:        # [B,M,K] @ [B,N,K]  (weight transposed)
+                return 2.0 * B * M * K * float(b[1])
+    except (TypeError, ValueError, IndexError):
+        pass
+    return float("nan")
+
+
+_ATTN_SKIP_RE = re.compile(
+    r"mla_reduce|kn_mla_reduce|softmax|kv_cache|set_mla_kv|"
+    r"kn_get_mla_metadata|paged_attention|PagedKVCache|radix", re.IGNORECASE)
+
+_MLA_QH_VH_RE = re.compile(r"qh(\d+)_vh(\d+)", re.IGNORECASE)
+_ATTN_HD_RE = re.compile(r"hd(\d+)", re.IGNORECASE)
+
+
+def _try_attention_flops(dims: list, kernel_name: str = "") -> float:
+    """Estimate FLOPs for attention compute kernels from Q/K/V tensor shapes.
+
+    Skips non-compute attention sub-kernels (reduce, softmax, kv_cache, etc.).
+
+    For MLA kernels whose name encodes head dims (e.g. ``mla_pfl_qh192_vh128``),
+    d_qk and d_v are parsed from the name so chunked/split input dims don't
+    mislead.  Otherwise head dims are inferred from the 3-D tensor shapes.
+
+    Prefill (self-attention):
+        FLOPs = 2 * S^2 * H * d_qk  +  2 * S^2 * H * d_v
+    Decode (Q against KV cache, S_q << S_kv):
+        FLOPs = 2 * S_q * S_kv * H * d_qk  +  2 * S_q * S_kv * H * d_v
+
+    Returns NaN when shapes can't be interpreted as attention.
+
+    Verified examples:
+        # MLA prefill, self-attn S=75600, qh192_vh128
+        #   dims=[[75600,40,192],[75600,40,192],[75600,40,128],...]
+        #   kernel="aiter::mla_pfl_qh192_vh128_..."
+        #   -> 2*75600^2*40*192 + 2*75600^2*40*128 = 146.313 TFLOP
+
+        # MLA reduce (skipped — non-compute sub-kernel)
+        #   kernel="...kn_mla_reduce_v1_ps..."  -> NaN
+
+        # MLA prefill USP split, Q=75600 KV=512, qh192_vh128
+        #   dims=[[75600,40,192],[512,40,192],[512,40,128],...]
+        #   -> 2*75600*512*40*192 + 2*75600*512*40*128 = 0.991 TFLOP
+
+        # Standard flash_attn, S=4096, hd128
+        #   dims=[[4096,32,128],[4096,32,128],[4096,32,128]]
+        #   -> 2*4096^2*32*128 * 2 = 0.275 TFLOP
+
+        # Unknown attn kernel (shape-only inference), S=2048, d=64
+        #   dims=[[2048,16,64],[2048,16,64],[2048,16,64]]
+        #   -> 2*2048^2*16*64 * 2 = 0.017 TFLOP
+    """
+    if _ATTN_SKIP_RE.search(kernel_name):
+        return float("nan")
+
+    if dims is None or not isinstance(dims, list):
+        return float("nan")
+
+    tensors_3d = [d for d in dims if isinstance(d, list) and len(d) == 3]
+    if len(tensors_3d) < 2:
+        return float("nan")
+
+    try:
+        # --- Extract head dims from kernel name if available ---
+        name_d_qk = name_d_v = None
+        m = _MLA_QH_VH_RE.search(kernel_name)
+        if m:
+            name_d_qk, name_d_v = int(m.group(1)), int(m.group(2))
+        else:
+            m = _ATTN_HD_RE.search(kernel_name)
+            if m:
+                name_d_qk = name_d_v = int(m.group(1))
+
+        # --- Group 3-D tensors by head count (dim[1]) ---
+        by_heads: Dict[int, list] = defaultdict(list)
+        for t in tensors_3d:
+            by_heads[t[1]].append(t)
+
+        for H_val, group in sorted(by_heads.items(), key=lambda x: -len(x[1])):
+            if len(group) < 2:
+                continue
+            H = float(H_val)
+
+            if name_d_qk is not None:
+                d_qk, d_v = float(name_d_qk), float(name_d_v or name_d_qk)
+                qk = [t for t in group if t[2] == name_d_qk]
+                if len(qk) < 2:
+                    continue
+                qk_seqs = sorted(set(t[0] for t in qk))
+                S_q = float(qk_seqs[-1])
+                S_kv = float(qk_seqs[0])
+                return 2.0 * S_q * S_kv * H * d_qk + 2.0 * S_q * S_kv * H * d_v
+
+            by_seq: Dict[int, list] = defaultdict(list)
+            for t in group:
+                by_seq[t[0]].append(t)
+            seq_vals = sorted(by_seq.keys())
+
+            # --- Prefill: >=2 tensors share the largest S ---
+            S_max = seq_vals[-1]
+            same_s = by_seq[S_max]
+            if len(same_s) >= 2:
+                S = float(S_max)
+                head_dims = sorted(set(t[2] for t in same_s), reverse=True)
+                if len(head_dims) == 1:
+                    d = float(head_dims[0])
+                    return 2.0 * S * S * H * d + 2.0 * S * S * H * d
+                if len(head_dims) >= 2:
+                    d_qk, d_v = float(head_dims[0]), float(head_dims[1])
+                    return 2.0 * S * S * H * d_qk + 2.0 * S * S * H * d_v
+
+            # --- Decode: Q=[B,H,d] small B, KV=[S,H,d] large S ---
+            if len(seq_vals) >= 2:
+                B_val, S_val = seq_vals[0], seq_vals[-1]
+                if B_val < S_val:
+                    B, S = float(B_val), float(S_val)
+                    head_dims = sorted(set(t[2] for t in group), reverse=True)
+                    if len(head_dims) == 1:
+                        d = float(head_dims[0])
+                        return 2.0 * B * S * H * d + 2.0 * B * S * H * d
+                    if len(head_dims) >= 2:
+                        d_qk, d_v = float(head_dims[0]), float(head_dims[1])
+                        return 2.0 * B * S * H * d_qk + 2.0 * B * S * H * d_v
+    except (TypeError, ValueError, IndexError):
+        pass
+    return float("nan")
+
+
+def _estimate_flops_from_parsed(dims: Any, category: str = "",
+                                kernel_name: str = "") -> float:
+    """Heuristic FLOP count from parsed Input Dims; NaN if unknown.
+
+    For attention kernels, uses 2*S^2*H*(d_qk+d_v) based on Q/K/V shapes.
+    For gemm/moe, scans all pairs of 2D/3D tensors to find the best matmul match
+    (handles multi-input ops where activation+weight aren't always the first two).
+    """
+    if dims is None:
+        return float("nan")
+    if not isinstance(dims, list) or len(dims) < 2:
+        return float("nan")
+
+    if category.lower() == "attention":
+        return _try_attention_flops(dims, kernel_name=kernel_name)
+
+    matrices = [(i, d) for i, d in enumerate(dims)
+                if isinstance(d, list) and len(d) in (2, 3)]
+    for i in range(len(matrices)):
+        for j in range(i + 1, len(matrices)):
+            flops = _try_gemm_flops(matrices[i][1], matrices[j][1])
+            if flops == flops:  # not NaN
+                return flops
+    return float("nan")
+
+
+def _detail_flops_and_tflop_metrics(d: KernelDetail) -> Tuple[float, Optional[float], Optional[float], str]:
+    """Return (raw FLOPs, TFLOP total, TFLOP/s, formula_label) for a detail row.
+
+    Only computes for gemm, attention, or moe categories with non-empty Input Dims.
+    formula_label is one of "2*M*K*N", "2*Sq*Skv*H*(dqk+dv)", or "".
+    """
+    cat = (d.category or "").lower()
+    if cat not in ("gemm", "attention", "moe"):
+        return float("nan"), None, None, ""
+    if not d.input_dims or not d.input_dims.strip():
+        return float("nan"), None, None, ""
+    parsed = _parse_dims_literal(d.input_dims)
+    flops = _estimate_flops_from_parsed(parsed, category=cat,
+                                        kernel_name=d.name)
+    if flops != flops:  # NaN
+        return flops, None, None, ""
+    formula = "2*Sq*Skv*H*(dqk+dv)" if cat == "attention" else "2*M*K*N"
+    tflop = flops / 1e12
+    dur = d.duration
+    if dur and dur > 0:
+        tflops = tflop / (dur / 1e6)
+    else:
+        tflops = None
+    return flops, tflop, tflops, formula
+
+
 class ModuleAggregator:
     """Compute per-module statistics with hierarchical breakdown."""
 
@@ -1487,15 +1703,28 @@ class ReportGenerator:
                               f"Wall time: {wall_time:,.0f} us  |  "
                               f"Overlap: {sum_dur - wall_time:,.0f} us  "
                               f"(% uses wall time)")
+            _formula_font = Font(italic=True, color="666666")
+            ws_det.cell(row=3, column=1,
+                        value="gemm / moe:").font = _formula_font
+            ws_det.cell(row=3, column=2,
+                        value="TFLOP = 2*M*K*N / 1e12").font = _formula_font
+            ws_det.cell(row=4, column=1,
+                        value="attention:").font = _formula_font
+            ws_det.cell(row=4, column=2,
+                        value="TFLOP = 2*Sq*Skv*H*(dqk+dv) / 1e12").font = _formula_font
+            ws_det.cell(row=5, column=1,
+                        value="throughput:").font = _formula_font
+            ws_det.cell(row=5, column=2,
+                        value="TFLOPs = TFLOP / (Duration_us / 1e6)").font = _formula_font
 
-            # Category summary table (rows 3+)
+            # Category summary table (rows 7+)
             cat_agg: Dict[str, float] = defaultdict(float)
             for d in all_details:
                 cat_agg[d.category] += d.duration
             sorted_cats = sorted(cat_agg.items(), key=lambda x: -x[1])
             cat_total = sum(cat_agg.values())
 
-            cur_row = 3
+            cur_row = 7
             for lbl, col_idx in [("Category", 1), ("Percentage (%)", 2),
                                  ("Total Duration (us)", 3)]:
                 cell = ws_det.cell(row=cur_row, column=col_idx, value=lbl)
@@ -1514,9 +1743,11 @@ class ReportGenerator:
             cur_row += 2  # blank row before kernel list
 
             # Kernel detail headers
-            det_headers = ["Module", "Input Dims", "Kernel Name",
-                          "Duration (us)", "% of wall time", "Category",
-                          "Path"]
+            det_headers = [
+                "Module", "Input Dims", "Kernel Name",
+                "Duration (us)", "% of wall time", "Category",
+                "Formula", "TFLOP", "TFLOPs", "Source",
+            ]
             for col, h in enumerate(det_headers, 1):
                 cell = ws_det.cell(row=cur_row, column=col, value=h)
                 cell.font = header_font
@@ -1526,13 +1757,20 @@ class ReportGenerator:
             for i, d in enumerate(all_details[:MAX_ROWS_PER_TAB], 1):
                 pct = d.duration / wall_time * 100 if wall_time > 0 else 0
                 leaf = d.module_path.rsplit("/", 1)[-1] if "/" in d.module_path else d.module_path
+                _, tflop, tflops, formula = _detail_flops_and_tflop_metrics(d)
                 ws_det.cell(row=cur_row, column=1, value=leaf)
                 ws_det.cell(row=cur_row, column=2, value=d.input_dims)
                 ws_det.cell(row=cur_row, column=3, value=d.name)
                 ws_det.cell(row=cur_row, column=4, value=round(d.duration, 1))
                 ws_det.cell(row=cur_row, column=5, value=round(pct, 1))
                 ws_det.cell(row=cur_row, column=6, value=d.category)
-                ws_det.cell(row=cur_row, column=7, value=d.source_path)
+                if formula:
+                    ws_det.cell(row=cur_row, column=7, value=formula)
+                if tflop is not None:
+                    ws_det.cell(row=cur_row, column=8, value=round(tflop, 6))
+                if tflops is not None:
+                    ws_det.cell(row=cur_row, column=9, value=round(tflops, 3))
+                ws_det.cell(row=cur_row, column=10, value=d.source_path)
                 cur_row += 1
             if detail_truncated:
                 ws_det.cell(row=cur_row, column=1,
@@ -1540,7 +1778,8 @@ class ReportGenerator:
             ws_det.column_dimensions["A"].width = 35
             ws_det.column_dimensions["B"].width = 60
             ws_det.column_dimensions["C"].width = 80
-            ws_det.column_dimensions["G"].width = 80
+            ws_det.column_dimensions["G"].width = 24
+            ws_det.column_dimensions["J"].width = 70
 
         wb.save(output_path)
         print(f"\nExcel report saved to: {output_path}")
