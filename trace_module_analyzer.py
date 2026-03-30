@@ -523,7 +523,7 @@ class CudaGraphCorrelator:
     """Correlate CUDA-graph-replayed kernels to synthetic layer modules."""
 
     _COMM_RE = re.compile(
-        r"all_reduce|cross_device_reduce|nccl|rccl|broadcast|allgather"
+        r"all_reduce|allreduce|cross_device_reduce|nccl|rccl|broadcast|allgather"
         r"|reduce_scatter|quickreduce|all_to_all", re.IGNORECASE)
     _ATTN_RE = re.compile(
         r"aiter::mla_|mla_a8w8|decode_attention|flash_attn|attention|softmax"
@@ -699,7 +699,7 @@ class CudaGraphCorrelator:
         attn_only = sum(1 for s in segments if s[2] and not s[3])
         full_layer = sum(1 for s in segments if s[2] and s[3])
 
-        if attn_only > full_layer:
+        if attn_only >= full_layer:
             return self._merge_half_layers(segments)
         else:
             return [(s[0], s[1], self._seg_label(s[2], s[3])) for s in segments]

@@ -1,5 +1,5 @@
 category,pattern
-communication,"all_reduce|cross_device_reduce|nccl|rccl|broadcast|allgather|reduce_scatter|quickreduce|all_to_all"
+communication,"all_reduce|allreduce|cross_device_reduce|nccl|rccl|broadcast|allgather|reduce_scatter|quickreduce|all_to_all"
 embedding,"embedding|rotary|rope|pos_enc"
 attention,"aiter::mla_|mla_a8w8|decode_attention|flash_attn|attention|softmax|fmha_|FmhaBatchPrefill|mla_reduce|kv_cache|flashinfer|set_mla_kv|paged_attention|radix|chunk_gated_delta_rule|chunk_fwd_kernel|causal_conv1d|fused_gdn"
 moe,"fused_moe|moe_align|topk|expert|MoeFlatmm|MoeSorting|kernel_moe_gemm|kernel_moe_mxgemm|shared_experts|grouped_topk|moe_fused_gate|moeSoftmax"
