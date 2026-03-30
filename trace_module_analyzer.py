@@ -1408,11 +1408,13 @@ class ReportGenerator:
             root_phase = self._infer_root_phase(rlist)
             print(f"  {rtype:<45s} {rtype_total:>14,.1f} {pct:>6.1f}%")
             if len(chain) > 1:
+                scoped_totals: Dict[str, float] = defaultdict(float)
+                self._collect_by_type_total(rlist, scoped_totals, mode)
                 children = chain[1:]
                 for i, ctype in enumerate(children):
                     is_last = (i == len(children) - 1)
                     connector = "└── " if is_last else "├── "
-                    ct = type_totals.get(ctype, 0)
+                    ct = scoped_totals.get(ctype, 0)
                     ct_pct = ct / grand_total * 100 if grand_total > 0 else 0
                     label = f"    {connector}{ctype}"
                     if ctype in top_type_names:
@@ -1837,10 +1839,8 @@ class ReportGenerator:
         """Write the Summary tab: kernel time summary with detail tabs, category breakdown."""
         from openpyxl.styles import Font, PatternFill
 
-        # Build wrapper chains and type totals
+        # Build wrapper chains
         root_chains: Dict[str, List[str]] = {}
-        type_totals: Dict[str, float] = defaultdict(float)
-        self._collect_by_type_total(stats_list, type_totals, mode)
         wrapper_types = self._find_wrapper_types(stats_list, mode)
         type_children_map = self._build_type_children(stats_list)
         root_types = {s.module_type for s in stats_list}
@@ -1887,11 +1887,13 @@ class ReportGenerator:
             ws.cell(row=row, column=3, value=f"{pct:.1f}%")
             row += 1
             if len(chain) > 1:
+                scoped_totals: Dict[str, float] = defaultdict(float)
+                self._collect_by_type_total(rlist, scoped_totals, mode)
                 children = chain[1:]
                 for i, ctype in enumerate(children):
                     is_last = (i == len(children) - 1)
                     connector = "└── " if is_last else "├── "
-                    ct = type_totals.get(ctype, 0)
+                    ct = scoped_totals.get(ctype, 0)
                     ct_pct = ct / grand_total * 100 if grand_total > 0 else 0
                     ws.cell(row=row, column=1, value=f"    {connector}{ctype}")
                     ws.cell(row=row, column=2, value=round(ct, 1))
